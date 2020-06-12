@@ -1,0 +1,9 @@
+work/
+*~
+logs/
+nf_reports/
+analysis/
+results/
+Makefile
+.nextflow/
+.nextflow.log*
