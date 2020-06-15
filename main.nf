@@ -102,7 +102,7 @@ workflow{
                             CreateIntervalBeds.out.flatten() )
     
     if (params.no_intervals  bedIntervals = Channel.from(file("no_intervals.bed"))
-    // FastQCFQ(ch_input_sample)
+    FastQCFQ(ch_input_sample)
    
 
 } // end of workflow
@@ -680,7 +680,7 @@ process AnnotateSquidOutput {
     """
 }
 
-process PostprocessAnnotatedSquidOutput {
+process AnnotateSquidOutputPostprocess {
     label 'cpus_2'
     tag {idSample}
 
@@ -713,6 +713,294 @@ process PostprocessAnnotatedSquidOutput {
     """
 }
 
+
+ 
+process addEGFRvIII {
+    label 'cpus_8'
+    tag {idSample}
+
+    publishDir "${params.outdir}/EGFR/${idSample}", 
+    mode: params.publish_dir_mode
+
+    input:
+    file(gtf)
+    file(cdna_fa)
+    
+    output:
+       file("*.cdna.fa")
+    
+    when 'suppa' in tools
+
+    script:
+    """
+    #!/usr/bin/env python
+    import pandas as pd
+    """ Modifying gtf file """
+    names=['seqname', 'source', 'feature', 'start', 'end', 'score', 'strand', 'frame', 'attribute']
+    orig = pd.read_csv( $gtf, comment= '#', delimiter= '\t', names= names)
+    egfr = orig.loc[ (orig.seqname == 'chr7') & (orig['start'] > 5.5e7) & (orig['end'] < 5.54e7)]
+    egfr['gene_id'] = egfr.attribute.str.split('gene_id "').str[1].str.split('";').str[0]
+    egfr = egfr.loc[egfr.gene_id.str.contains('ENSG00000146648')]
+    egfr['transcript_id'] = egfr.attribute.str.split('; transcript_id "').str[1].str.split('";').str[0]
+    egfr['transcript_name'] = egfr.attribute.str.split('; transcript_name "').str[1].str.split('";').str[0]
+    egfr['exon_number'] = egfr.attribute.str.split('; exon_number ').str[1].str.split(';').str[0]
+    egfr.loc[~egfr.exon_number.isnull(),'exon_number'] = egfr.loc[~egfr.exon_number.isnull(),'exon_number'].astype(int)
+    egfr['length'] = egfr['end'] - egfr['start'] + 1
+    wt = egfr.loc[egfr.transcript_name == 'EGFR-001']
+    if 'EGFRvIII' not in egfr.transcript_id.tolist():
+        egfr3 = wt.loc[wt.exon_number.isnull() | (wt.exon_number < 2) | (wt.exon_number > 7)]
+        egfr3['attribute'] = 'gene_id "ENSG00000146648.11"; transcript_id "EGFRvIII";'
+        egfr3 = egfr3[egfr3.columns[:9]]
+        orig = orig.loc[:wt.index.max()].append(egfr3,ignore_index=True)\
+        .append(orig.loc[wt.index.max() + 1:],ignore_index=True)
+        orig.to_csv(gtf,index=False,header=False,quoting=csv.QUOTE_NONE,sep='\t')
+        """ Adding comments """
+        tempData = open(gtf,'r')
+        orig = tempData.read()
+        tempData.close()
+        orig = """##description: modified version of GRCh37 to include EGFRvIII
+                ##provider: Taylor Firman
+                ##contact: taylor.firman@childrenscolorado.org
+                ##format: gtf
+                ##date: 2020-05-18
+                """ + orig
+                        tempData = open(gtf,'w')
+                        tempData.write(orig)
+                        tempData.close()
+    """ Modifying cdna file (assuming it has the same filename prefix) """
+    tempData = open('.'.join(gtf.split('.')[:-1]) + '.cdna.fa','r')
+    sequences = tempData.read()[1:].split('\n>')
+    tempData.close()
+    transcripts = [seq.split(' ')[0] for seq in sequences]
+    if 'EGFRvIII' not in transcripts:
+        ind = transcripts.index('ENST00000275493.2')
+        egfr = ''.join(sequences[ind].split('\n')[1:])
+        egfr3 = egfr[:wt.loc[(wt.feature == 'exon') & (wt.exon_number == 1)].length.sum()] + \
+        egfr[wt.loc[(wt.feature == 'exon') & (wt.exon_number < 8)].length.sum():]
+        egfr3 = 'EGFRvIII ENSG00000146648.11 EGFR \n' + '\n'.join([egfr3[line*60:(line + 1)*60] for line in range(len(egfr3)//60 + 1)])
+        sequences = sequences[:ind + 1] + [egfr3] + sequences[ind + 1:]
+        sequences = '>' + '\n>'.join(sequences)
+        tempData = open('.'.join(gtf.split('.')[:-1]) + '.cdna.fa','w')
+        tempData.write(sequences)
+        tempData.close()
+    """
+}
+
+process Suppa {
+    label 'cpus_8'
+    tag {idPatient + "-" + idSample}
+
+    publishDir "${params.outdir}/Suppa/${idSample}", 
+    mode: params.publish_dir_mode
+
+    input:
+    tuple idPatient, idSample, idRun, file("${sample_run}_R1.fastq.gz"), file("${sample_run}_R2.fastq.gz")
+    file(salmon_index)
+    file(gtf)
+
+    output:
+        tuple val(idSample), file("${idSample}_fusions_sv.txt")
+
+    when: 'squid' in tools
+    
+    script:
+    """
+    salmon_quant.sh \
+            ${salmon_index} \
+            "${sample_run}_R1.fastq.gz" \
+            "${sample_run}_R2.fastq.gz" \
+            ${task.cpus}
+
+    suppa.py generateEvents -i ${gtf} -o ${gtf}.events -e SE -f ioe
+    multipleFieldSelection.py -i ${idSample}_quant.sf -k 1 -f 4 -o ${idSample}_iso_tpm.txt
+    suppa.py psiPerIsoform -g ${gtf} -e ${idSample}_iso_tpm.txt -o ${idSample}.iso.psi
+    """
+}
+
+process SuppaPostprocess {
+    label 'cpus_8'
+    tag {idSample}
+
+    publishDir "${params.outdir}/Suppa/${idSample}", 
+    mode: params.publish_dir_mode
+
+    input:
+    tuple val(idSample), file(events_psi), file(iso_psi)
+
+    output:
+        file("${idSample}.ExonSkipping.txt")
+
+    when: 'suppa' in tools
+    
+    script:
+    """
+     #!/usr/bin/env python
+    import pandas as pd
+    cols = {'index':'event','SUPPA':'PSI'}
+    iso = pd.read_csv(${isoform_psi}, delimiter='\t').reset_index().rename(columns=cols),ignore_index=True)
+    events = pd.read_csv(${events_psi}, delimiter='\t').reset_index().rename(columns=cols)
+    psi = events.append(iso)
+    tmp = pd.DataFrame({'event':['ENSG00000146648.11;EGFRvIII',\
+    'ENSG00000105976.10;SE:chr7:116411708-116411903:116412043-116414935:+'],\
+    'name':['EGFR variant III','MET Exon 14 Skipping']})
+    
+    psi = pd.merge(left = psi, right = tmp , how = 'inner', on='event')
+    psi.to_csv("${idSample}.ExonSkipping.txt")
+    """
+}
+
+process FusionReport {
+    label 'cpus_8'
+    tag {idSample}
+
+    publishDir "${params.outdir}/Report/${idSample}", 
+    mode: params.publish_dir_mode
+
+    input:
+    file(db)
+    tuple val(idSample), file(db), file(arriba), file(starfusion), file(squid), file(es)
+
+    output:
+        file("Fusion_Report")
+
+    when: 'fusion_report' in tools
+    
+    script:
+    """
+    fusion_report run ${idSample} Fusion_Report ${db} \
+            --arriba ${arriba} \
+            --starfusion ${starfusion} \
+            --squid ${squid} \
+            --ericscript ${ericscript}
+    mv Fusion_Report/fusion_list.tsv Fusion_Report/${idSample}_fusion_list.tsv
+    mv Fusion_Report/fusion_genes_mqc.json Fusion_Report/${idSample}_fusion_genes_mqc.json
+    """
+}
+
+process CollectInsertSizeMetrics{
+    label 'cpus_32'
+    tag {idPatient + "-" + idSample}
+    
+    publishDir "${params.outdir}/Reports/${idSample}/insert_size_metrics/", mode: params.publish_dir_mode
+    
+    input:
+    tuple val(sampleId), file(bam)
+
+    output:
+    file("${sampleId}_aligned_insert_size_metrics.txt")
+    file("${sampleId}_aligned_insert_size_histogram.pdf")
+    
+    when: !('insert_size_metrics' in skipQC)
+    script:
+    """
+    gatk CollectInsertSizeMetrics \
+      -I ${bam} \
+      -O ${sampleId}_aligned_insert_size_metrics.txt \
+      -H ${sampleId}_aligned_insert_size_histogram.pdf \
+      M=0.5
+    """
+}
+
+process CollectRnaSeqMetrics{
+    label 'cpus_32'
+    tag {idPatient + "-" + idSample}
+    
+    publishDir "${params.outdir}/Reports/${idSample}/insert_size_metrics/", mode: params.publish_dir_mode
+    
+    input:
+    tuple val(sampleId), file(bam)
+    file(ref_flat)
+
+    output:
+    file("${sampleId}_aligned_rna_metrics.txt")
+    
+    when: !('rna_seq_metrics' in skipQC)
+
+    script:
+    """
+    gatk CollectRnaSeqMetrics \
+      -I ${bam} \
+      -O ${sampleId}_aligned_rna_metrics.txt \
+      -REF_FLAT ${ref_flat} \
+      -STRAND SECOND_READ_TRANSCRIPTION_STRAND
+    """
+}
+
+process ResultsExcel{
+    label 'cpus_32'
+    tag {idPatient + "-" + idSample}
+    
+    publishDir "${params.outdir}/Reports/${idSample}/ResultsExcel/", mode: params.publish_dir_mode
+    
+    input:
+    file(fusion_json)
+    file(exon_skipping)
+
+    output:
+    file("${sampleId}_detected_fusions.xlsx")
+    
+    when: !('results_excel' in skipQC)
+
+    script:
+    """
+    #!/usr/bin/env python
+    import pandas as pd
+    tempData = open(${fusion_json},'r')
+    df = pd.DataFrame(json.load(tempData))
+    df['Databases'] = df['Databases'].apply(', '.join)
+    df["5' Partner Position"] = None
+    df["3' Partner Position"] = None
+    tempData.close()
+    for aligner in ['arriba','starfusion','ericscript','squid']:
+        if vars(options)[aligner]:
+            inds = ~df[aligner].isnull()
+            if inds.sum() > 0:
+                for stat in df.loc[inds,aligner].values[0].keys():
+                    df.loc[inds,aligner + '_'  + stat] = df.loc[inds,aligner].apply(lambda x: x[stat])
+                    if aligner == 'arriba' and stat == 'position':
+                        df.loc[inds & df["5' Partner Position"].isnull(),"5' Partner Position"] = \
+                        'chr' + df.loc[inds & df["5' Partner Position"].isnull(),aligner + '_' + stat].str.split('#').str[0]
+                        df.loc[inds & df["3' Partner Position"].isnull(),"3' Partner Position"] = \
+                        'chr' + df.loc[inds & df["3' Partner Position"].isnull(),aligner + '_' + stat].str.split('#').str[1]
+                    elif aligner == 'starfusion' and stat == 'position':
+                        df.loc[inds & df["5' Partner Position"].isnull(),"5' Partner Position"] = \
+                        df.loc[inds & df["5' Partner Position"].isnull(),aligner + '_' + stat].str.split('#').str[0].str[:-2]
+                        df.loc[inds & df["3' Partner Position"].isnull(),"3' Partner Position"] = \
+                        df.loc[inds & df["3' Partner Position"].isnull(),aligner + '_' + stat].str.split('#').str[1].str[:-2]
+            del df[aligner]
+    df['Reading Frame'] = df['arriba_reading-frame'] if options.arriba else None
+    df['Type'] = df['arriba_type'] if options.arriba else None
+    df["5' Partner Coverage"] = df['arriba_coverage1'] if options.arriba else None
+    df["3' Partner Coverage"] = df['arriba_coverage2'] if options.arriba else None
+    df['Call Confidence'] = df['arriba_confidence'] if options.arriba else None
+    df['FFPM'] = df['starfusion_ffmp'] if options.starfusion else None
+    df['PSI'] = None
+    if options.suppa:
+        suppa_vars = pd.read_csv(${exon_skipping}.format(options.samples,options.samples.split('/')[-1]),delimiter='\t')
+        suppa_vars = suppa_vars[['name','PSI']].rename(columns={'name':'Fusion'})
+        suppa_vars['Type'] = 'exon skipping'
+        df = df.append(suppa_vars,ignore_index=True)
+    df['Report (Y/N)'] = 'N'
+    df = df[['Fusion','Databases','Score','Explained score',"5' Partner Position",\
+    "3' Partner Position",'Reading Frame','Type',"5' Partner Coverage",\
+    "3' Partner Coverage",'Call Confidence','FFPM','PSI','Report (Y/N)'] + \
+    [col for col in df.columns if col.split('_')[0] in ['arriba','starfusion','ericscript','squid']]]
+    writer = pd.ExcelWriter("${sampleId}_detected_fusions.xlsx",engine='xlsxwriter')
+    f = writer.book.add_format()
+    f.set_align('center')
+    f.set_align('vcenter')
+    df.to_excel(writer,sheet_name='Fusions',index=False)
+    for idx, col in enumerate(df):
+        series = df[col]
+        max_len = min(max((series.astype(str).map(len).max(),len(str(series.name)))) + 1,150)
+        writer.sheets['Fusions'].set_column(idx,idx,max_len,f,{'hidden':col.split('_')[0] \
+        in ['arriba','starfusion','ericscript','squid'] or col == 'Explained score'})
+    writer.sheets['Fusions'].autofilter('A1:' + (chr(64 + (df.shape[1] - 1)//26) + \
+    chr(65 + (df.shape[1] - 1)%26)).replace('@','') + str(df.shape[0] + 1))
+    writer.sheets['Fusions'].freeze_panes(1,1)
+    writer.save()
+    """
+}
 
 
 /*
